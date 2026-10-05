@@ -37,6 +37,16 @@
   .legend .all a { color: #2f5d3a; cursor: pointer; text-decoration: underline; margin-right: 8px; }
   .lbl { background: none; border: 0; box-shadow: none; font-size: 10px; font-weight: 600; color: #222; text-shadow: 0 0 3px #fff, 0 0 3px #fff; text-align: center; }
   #status { font-size: 12px; opacity: .85; }
+  form.entry { background: #fff; border: 1px solid #cfdccf; border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; }
+  form.entry h3 { font-size: 14px; margin: 0 0 8px; color: #2f5d3a; }
+  form.entry label { display: block; font-size: 12px; color: #555; margin: 8px 0 3px; }
+  form.entry select, form.entry input, form.entry textarea { width: 100%; padding: 6px 8px; font-size: 15px; border: 1px solid #ccc; border-radius: 6px; font-family: inherit; background: #fff; }
+  form.entry textarea { min-height: 60px; resize: vertical; }
+  form.entry .row { display: flex; gap: 8px; } form.entry .row > div { flex: 1; }
+  form.entry button { margin-top: 10px; width: 100%; padding: 9px; font-size: 15px; border: 0; border-radius: 6px; background: #2f5d3a; color: #fff; cursor: pointer; }
+  form.entry button:disabled { background: #999; }
+  .msg { font-size: 13px; margin-top: 6px; } .msg.ok { color: #2e7d32; } .msg.ng { color: #c62828; }
+  .req { color: #c62828; }
   @media (max-width: 760px) {
     #main { flex-direction: column; }
     #panel { width: 100%; height: 40%; border-left: 0; border-top: 1px solid #ddd; }
@@ -59,7 +69,7 @@
   </header>
   <div id="main">
     <div id="map"></div>
-    <aside id="panel"><p class="muted">筆ポリゴンをクリックすると、地目・最新の調査結果・調査履歴が表示されます。</p></aside>
+    <aside id="panel"><p class="muted">筆ポリゴンをクリックすると、地目・最新の調査結果・調査履歴が表示されます(入力が有効な場合は、ここから調査結果を保存できます)。</p></aside>
   </div>
 </div>
 
@@ -69,6 +79,9 @@ const CONFIG = {
   fields: 'data/fields.geojson',   // 筆ポリゴン(tools/prepare_data.py で作成)
   // 調査記録。ファイルの代わりに、Googleスプレッドシートの「ウェブに公開(CSV)」URLも指定可(README参照)
   survey: 'data/survey.csv',
+  // 書き込み用API(Apps Scriptのウェブアプリ URL)。設定すると表示もこちらから読み、入力フォームが出ます
+  api: 'https://script.google.com/macros/s/AKfycbz3T_HwPGR0RcxYD0Nr1jtNJhsejzeFXx4ekYxUO4cbhiVDOlPImNFYDycF89aE3R8/exec',
+  surveyors: ['A', 'B', 'C', 'その他'],   // 調査者の選択肢
   idField: 'fid',
   statusField: '作付状況',
   colors: {                        // Streamlit版と同じ区分
@@ -129,21 +142,33 @@ const restyle = () => { fieldLayer.eachLayer(l => l.setStyle(styleOf(String(l.fe
 async function loadAll() {
   setStatus('読み込み中…');
   const bust = u => u + (u.includes('?') ? '&' : '?') + 't=' + Date.now();
-  const [geo, csvText] = await Promise.all([
+  const [geo, rows] = await Promise.all([
     fetch(bust(CONFIG.fields)).then(r => { if (!r.ok) throw new Error(CONFIG.fields); return r.json(); }),
-    fetch(bust(CONFIG.survey)).then(r => r.ok ? r.text() : ''),
+    CONFIG.api
+      ? fetch(bust(CONFIG.api)).then(r => r.json()).then(j => { if (!j.ok) throw new Error('API: ' + j.error); return j.rows; })
+      : fetch(bust(CONFIG.survey)).then(r => r.ok ? r.text() : '').then(t => Papa.parse(t, { header: true, skipEmptyLines: true }).data),
   ]);
   history = {};
-  Papa.parse(csvText, { header: true, skipEmptyLines: true }).data.forEach(row => {
-    const raw = row[CONFIG.idField]; if (raw == null || raw === '') return;
-    const id = String(parseInt(raw, 10));
-    (history[id] ||= []).push(row);
-  });
-  Object.values(history).forEach(a => a.sort((x, y) => sortKey(y).localeCompare(sortKey(x))));
+  rows.forEach(addRecord);
+  sortHistory();
   draw(geo);
-  const n = Object.keys(history).length, total = geo.features.length;
-  setStatus(`調査済 ${n} / ${total} 筆`);
+  setStatus(statusText());
 }
+// 2026-05-22T15:00:00.000Z のようなUTC表記を日本時間の文字列に直す
+function toJST(v, dateOnly) {
+  if (!/^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(v)) return v;
+  const s = new Date(Date.parse(v) + 9 * 3600e3).toISOString().replace('T', ' ').slice(0, 19);
+  return dateOnly || s.endsWith('00:00:00') ? s.slice(0, 10) : s;
+}
+function addRecord(row) {
+  const raw = row[CONFIG.idField]; if (raw == null || raw === '') return;
+  const id = String(parseInt(raw, 10)); if (id === 'NaN') return;
+  Object.keys(row).forEach(k => { if (row[k] == null) row[k] = ''; else row[k] = String(row[k]); });
+  ['調査日', 'タイムスタンプ'].forEach(k => row[k] = toJST(row[k], k === '調査日'));
+  (history[id] ||= []).push(row);
+}
+const sortHistory = () => Object.values(history).forEach(a => a.sort((x, y) => sortKey(y).localeCompare(sortKey(x))));
+const statusText = () => `調査済 ${Object.keys(history).length} / ${Object.keys(byId).length} 筆`;
 const setStatus = t => document.getElementById('status').textContent = t;
 
 function draw(geo) {
@@ -155,8 +180,8 @@ function draw(geo) {
     onEachFeature: (f, layer) => {
       const id = String(f.properties[CONFIG.idField]);
       byId[id] = layer;
-      const r = latest(id);
-      layer.bindTooltip(`fid ${esc(id)}(${esc(f.properties['地目'] || '')})<br>${r ? esc(r[CONFIG.statusField]) + (r['作目'] ? ':' + esc(String(r['作目']).slice(0, 30)) : '') : '未調査'}`, { sticky: true });
+      layer.bindTooltip(() => { const r = latest(id);
+        return `fid ${esc(id)}(${esc(f.properties['地目'] || '')})<br>${r ? esc(r[CONFIG.statusField]) + (r['作目'] ? ':' + esc(String(r['作目']).slice(0, 30)) : '') : '未調査'}`; }, { sticky: true });
       layer.on('click', () => select(id));
       labelLayer.addLayer(L.marker(layer.getBounds().getCenter(), {
         icon: L.divIcon({ className: 'lbl', html: esc(id), iconSize: [30, 12] }), interactive: false }));
@@ -207,6 +232,7 @@ function select(id, zoom) {
   const chip = st => `<span class="chip" style="background:${colorOf(st) || '#fff'};color:${['耕作放棄','水稲','果樹','そば'].includes(st) ? '#fff' : '#222'}">${esc(st)}</span>`;
   panel.innerHTML = `
     <h2>fid ${esc(id)} <span class="muted" style="font-weight:400">(${esc(p['地目'] || '地目不明')})</span></h2>
+    ${CONFIG.api ? formHtml(id) : ''}
     ${r ? `<table>
       <tr><th>作付状況</th><td>${chip(r[CONFIG.statusField])}</td></tr>
       <tr><th>作目</th><td>${esc(r['作目'])}</td></tr>
@@ -218,6 +244,66 @@ function select(id, zoom) {
       <div class="card"><div class="d">${esc(h['調査日'])} ・ 調査者 ${esc(h['調査者'])}</div>
       ${chip(h[CONFIG.statusField])}${esc(h['作目'])}
       ${h['備考'] ? `<div style="white-space:pre-wrap;margin-top:3px">${esc(h['備考'])}</div>` : ''}</div>`).join('') : ''}`;
+  panel.scrollTop = 0;
+  if (CONFIG.api) bindForm(id);
+}
+
+// ---------- 入力フォーム ----------
+const store = { get: k => { try { return localStorage.getItem(k) || ''; } catch { return ''; } },
+                set: (k, v) => { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch {} } };
+const today = () => { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 10); };
+
+function formHtml(id) {
+  const last = store.get('surveyor');
+  return `<form class="entry" id="entry">
+    <h3>この筆の調査結果を入力</h3>
+    <label>作付状況 <span class="req">*</span></label>
+    <select name="作付状況" required><option value="">選択してください</option>
+      ${Object.keys(CONFIG.colors).map(k => `<option>${esc(k)}</option>`).join('')}</select>
+    <label>作目(例:キャベツ、ブロッコリー)</label>
+    <input name="作目" autocomplete="off">
+    <div class="row">
+      <div><label>調査日</label><input name="調査日" type="date" value="${today()}"></div>
+      <div><label>調査者 <span class="req">*</span></label>
+        <select name="調査者" required><option value="">選択</option>
+          ${CONFIG.surveyors.map(k => `<option ${k === last ? 'selected' : ''}>${esc(k)}</option>`).join('')}</select></div>
+    </div>
+    <label>備考(雑草の繁茂状況・獣害など)</label>
+    <textarea name="備考"></textarea>
+    <button type="submit">保存</button>
+    <div class="msg" id="msg"></div>
+  </form>`;
+}
+
+function bindForm(id) {
+  const form = document.getElementById('entry'), msg = document.getElementById('msg');
+  form.onsubmit = async e => {
+    e.preventDefault();
+    const fd = Object.fromEntries(new FormData(form));
+    if (!fd['作付状況'] || !fd['調査者']) { msg.className = 'msg ng'; msg.textContent = '作付状況と調査者を選んでください。'; return; }
+    let pass = store.get('passcode');
+    if (!pass) { pass = prompt('入力用の合言葉を入れてください(この端末に記憶されます)'); if (!pass) return; }
+    const c = byId[id].getBounds().getCenter();
+    const btn = form.querySelector('button'); btn.disabled = true; btn.textContent = '保存中…'; msg.textContent = '';
+    try {
+      // Content-Typeを付けない(text/plain扱い)ことで、Apps Scriptへ直接POSTできる
+      const res = await fetch(CONFIG.api, { method: 'POST',
+        body: JSON.stringify({ ...fd, fid: Number(id), point_lng: +c.lng.toFixed(7), point_lat: +c.lat.toFixed(7), passcode: pass }) });
+      const j = await res.json();
+      if (!j.ok) {
+        if (j.error === 'passcode') { store.set('passcode', ''); throw new Error('合言葉が違います。もう一度保存してください。'); }
+        throw new Error(j.error);
+      }
+      store.set('passcode', pass); store.set('surveyor', fd['調査者']);
+      addRecord(j.row); sortHistory();
+      byId[id].setStyle(styleOf(id)); drawLegend(); setStatus(statusText());
+      select(id, false);
+      const m = document.getElementById('msg'); m.className = 'msg ok'; m.textContent = `保存しました(${j.row['タイムスタンプ']})`;
+    } catch (err) {
+      btn.disabled = false; btn.textContent = '保存';
+      msg.className = 'msg ng'; msg.textContent = '保存できませんでした:' + err.message;
+    }
+  };
 }
 
 function updateLabels() {
@@ -237,7 +323,7 @@ document.getElementById('kw').addEventListener('input', e => {
     const hit = Object.keys(byId).filter(visible);
     setStatus(`「${keyword}」該当 ${hit.length} 筆`);
     if (hit.length) map.fitBounds(L.featureGroup(hit.map(i => byId[i])).getBounds(), { maxZoom: 18, padding: [30, 30] });
-  } else setStatus(`調査済 ${Object.keys(history).length} / ${Object.keys(byId).length} 筆`);
+  } else setStatus(statusText());
 });
 document.getElementById('reload').onclick = () => loadAll().catch(showErr);
 let here = null;
