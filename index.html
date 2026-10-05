@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>川島地区農地調査マップ</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: system-ui, "Hiragino Sans", "Yu Gothic UI", sans-serif; color: #222; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  header { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: #2f5d3a; color: #fff; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .tools { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+  header input { padding: 5px 8px; border-radius: 6px; border: 0; font-size: 14px; }
+  #q { width: 90px; } #kw { width: 170px; }
+  header button { padding: 5px 10px; border-radius: 6px; border: 0; background: #fff; color: #2f5d3a; font-size: 14px; cursor: pointer; }
+  #main { flex: 1; display: flex; min-height: 0; }
+  #map { flex: 1; }
+  #panel { width: 340px; overflow-y: auto; border-left: 1px solid #ddd; padding: 12px 14px; background: #fafafa; font-size: 14px; }
+  #panel h2 { font-size: 15px; margin: 0 0 8px; }
+  #panel table { width: 100%; border-collapse: collapse; margin-bottom: 14px; }
+  #panel th, #panel td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #e5e5e5; vertical-align: top; }
+  #panel th { width: 30%; color: #555; font-weight: 500; white-space: nowrap; }
+  #panel td { white-space: pre-wrap; word-break: break-all; }
+  .card { background: #fff; border: 1px solid #e3e3e3; border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; }
+  .card .d { font-size: 12px; color: #666; }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid #0003; margin-right: 4px; }
+  .muted { color: #888; }
+  .legend { background: #fff; padding: 8px 10px; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,.3); font-size: 13px; line-height: 1.75; max-height: 60vh; overflow-y: auto; }
+  .legend label { display: block; cursor: pointer; white-space: nowrap; }
+  .legend i { display: inline-block; width: 14px; height: 14px; margin: 0 6px 0 2px; vertical-align: -2px; border: 1px solid #555; }
+  .legend .n { color: #777; margin-left: 4px; }
+  .legend .all { font-size: 12px; margin-top: 4px; }
+  .legend .all a { color: #2f5d3a; cursor: pointer; text-decoration: underline; margin-right: 8px; }
+  .lbl { background: none; border: 0; box-shadow: none; font-size: 10px; font-weight: 600; color: #222; text-shadow: 0 0 3px #fff, 0 0 3px #fff; text-align: center; }
+  #status { font-size: 12px; opacity: .85; }
+  @media (max-width: 760px) {
+    #main { flex-direction: column; }
+    #panel { width: 100%; height: 40%; border-left: 0; border-top: 1px solid #ddd; }
+    #kw { width: 120px; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>川島地区 農地調査マップ(信大雑草研)</h1>
+    <span id="status"></span>
+    <div class="tools">
+      <input id="q" type="number" placeholder="fid">
+      <button id="go">移動</button>
+      <input id="kw" type="search" placeholder="作目・備考で絞込(例:キャベツ)">
+      <button id="locate" title="現在地">現在地</button>
+      <button id="reload">再読み込み</button>
+    </div>
+  </header>
+  <div id="main">
+    <div id="map"></div>
+    <aside id="panel"><p class="muted">筆ポリゴンをクリックすると、地目・最新の調査結果・調査履歴が表示されます。</p></aside>
+  </div>
+</div>
+
+<script>
+// ===================== 設定(ここだけ編集すればOK) =====================
+const CONFIG = {
+  fields: 'data/fields.geojson',   // 筆ポリゴン(tools/prepare_data.py で作成)
+  // 調査記録。ファイルの代わりに、Googleスプレッドシートの「ウェブに公開(CSV)」URLも指定可(README参照)
+  survey: 'data/survey.csv',
+  idField: 'fid',
+  statusField: '作付状況',
+  colors: {                        // Streamlit版と同じ区分
+    '水稲':   '#3b7dd8',
+    '麦':     '#f0a030',
+    '大豆':   '#4caf50',
+    'そば':   '#9c5fc7',
+    '果樹':   '#a83232',
+    '野菜類': '#5fa8a8',
+    '作付なし': '#9e9e9e',
+    '耕作放棄': '#333333',
+    '不明':   '#ffffff',
+    '宅地等': '#e8d9b5',
+  },
+  otherColor: '#ff3b3b',           // 上記以外の値
+  showLabels: 18,                  // このズーム以上でfid番号を表示
+  overlays: [                      // UAVオルソ等(QGISでXYZタイル化して tiles/ に置く)
+    // { name: 'UAVオルソ 2026-07', url: 'tiles/ortho202607/{z}/{x}/{y}.jpg', maxNativeZoom: 20 },
+  ],
+};
+// ======================================================================
+
+const map = L.map('map', { maxZoom: 21 });
+const gsi = '<a href="https://maps.gsi.go.jp/development/ichiran.html">地理院タイル</a>';
+const bases = {
+  '地理院 航空写真': L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg', { attribution: gsi, maxNativeZoom: 18, maxZoom: 21 }),
+  '地理院 淡色地図': L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png', { attribution: gsi, maxNativeZoom: 18, maxZoom: 21 }),
+  '地理院 標準地図': L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', { attribution: gsi, maxNativeZoom: 18, maxZoom: 21 }),
+  'OpenStreetMap': L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors', maxNativeZoom: 19, maxZoom: 21 }),
+};
+bases['地理院 航空写真'].addTo(map);
+L.control.scale({ imperial: false }).addTo(map);
+const overlayLayers = {};
+CONFIG.overlays.forEach(o => overlayLayers[o.name] = L.tileLayer(o.url, { maxNativeZoom: o.maxNativeZoom || 20, maxZoom: 21 }));
+
+let fieldLayer = null, layerCtl = null, legendCtl = null;
+const labelLayer = L.layerGroup();
+let byId = {}, history = {}, selected = null;
+const hidden = new Set();         // 凡例で非表示にした区分
+let keyword = '';
+
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const sortKey = r => String(r['調査日'] || '') + ' ' + String(r['タイムスタンプ'] || '').split(/\D+/).map(n => n.padStart(4, '0')).join('');
+const latest = id => (history[id] || [])[0];
+const statusOf = id => latest(id)?.[CONFIG.statusField] || '未調査';
+const colorOf = st => st === '未調査' ? null : (CONFIG.colors[st] || CONFIG.otherColor);
+const matches = id => !keyword || (history[id] || []).some(r => ((r['作目'] || '') + ' ' + (r['備考'] || '')).includes(keyword));
+const visible = id => !hidden.has(statusOf(id)) && matches(id);
+
+function styleOf(id) {
+  const st = statusOf(id), c = colorOf(st), sel = id === selected;
+  if (!visible(id)) return { opacity: 0, fillOpacity: 0, interactive: false };
+  return { color: sel ? '#00e5ff' : (c ? '#ffffff' : '#ffeb3b'), weight: sel ? 4 : (c ? 1.2 : 1),
+           fillColor: c || '#000', fillOpacity: c ? 0.6 : 0, opacity: 1 };
+}
+const restyle = () => { fieldLayer.eachLayer(l => l.setStyle(styleOf(String(l.feature.properties[CONFIG.idField])))); };
+
+async function loadAll() {
+  setStatus('読み込み中…');
+  const bust = u => u + (u.includes('?') ? '&' : '?') + 't=' + Date.now();
+  const [geo, csvText] = await Promise.all([
+    fetch(bust(CONFIG.fields)).then(r => { if (!r.ok) throw new Error(CONFIG.fields); return r.json(); }),
+    fetch(bust(CONFIG.survey)).then(r => r.ok ? r.text() : ''),
+  ]);
+  history = {};
+  Papa.parse(csvText, { header: true, skipEmptyLines: true }).data.forEach(row => {
+    const raw = row[CONFIG.idField]; if (raw == null || raw === '') return;
+    const id = String(parseInt(raw, 10));
+    (history[id] ||= []).push(row);
+  });
+  Object.values(history).forEach(a => a.sort((x, y) => sortKey(y).localeCompare(sortKey(x))));
+  draw(geo);
+  const n = Object.keys(history).length, total = geo.features.length;
+  setStatus(`調査済 ${n} / ${total} 筆`);
+}
+const setStatus = t => document.getElementById('status').textContent = t;
+
+function draw(geo) {
+  const first = !fieldLayer;
+  if (fieldLayer) { map.removeLayer(fieldLayer); layerCtl.remove(); }
+  labelLayer.clearLayers(); byId = {};
+  fieldLayer = L.geoJSON(geo, {
+    style: f => styleOf(String(f.properties[CONFIG.idField])),
+    onEachFeature: (f, layer) => {
+      const id = String(f.properties[CONFIG.idField]);
+      byId[id] = layer;
+      const r = latest(id);
+      layer.bindTooltip(`fid ${esc(id)}(${esc(f.properties['地目'] || '')})<br>${r ? esc(r[CONFIG.statusField]) + (r['作目'] ? ':' + esc(String(r['作目']).slice(0, 30)) : '') : '未調査'}`, { sticky: true });
+      layer.on('click', () => select(id));
+      labelLayer.addLayer(L.marker(layer.getBounds().getCenter(), {
+        icon: L.divIcon({ className: 'lbl', html: esc(id), iconSize: [30, 12] }), interactive: false }));
+    },
+  }).addTo(map);
+  layerCtl = L.control.layers(bases, { '筆ポリゴン': fieldLayer, 'fid番号': labelLayer, ...overlayLayers }).addTo(map);
+  updateLabels();
+  drawLegend();
+  if (first) map.fitBounds(fieldLayer.getBounds(), { padding: [10, 10] });
+  if (selected && byId[selected]) select(selected, false);
+}
+
+function drawLegend() {
+  if (legendCtl) legendCtl.remove();
+  const counts = {};
+  Object.keys(byId).forEach(id => { const s = statusOf(id); counts[s] = (counts[s] || 0) + 1; });
+  const cats = [...Object.keys(CONFIG.colors), ...Object.keys(counts).filter(k => !(k in CONFIG.colors) && k !== '未調査'), '未調査']
+    .filter(k => counts[k]);
+  legendCtl = L.control({ position: 'bottomright' });
+  legendCtl.onAdd = () => {
+    const d = L.DomUtil.create('div', 'legend');
+    L.DomEvent.disableClickPropagation(d); L.DomEvent.disableScrollPropagation(d);
+    d.innerHTML = `<b>${esc(CONFIG.statusField)}</b>` + cats.map(k => {
+      const c = colorOf(k);
+      const sw = c ? `background:${c}` : 'background:transparent;border:2px solid #e6c400';
+      return `<label><input type="checkbox" data-k="${esc(k)}" ${hidden.has(k) ? '' : 'checked'}><i style="${sw}"></i>${esc(k)}<span class="n">${counts[k]}</span></label>`;
+    }).join('') + '<div class="all"><a data-a="on">全表示</a><a data-a="off">全解除</a></div>';
+    d.querySelectorAll('input').forEach(cb => cb.onchange = () => { cb.checked ? hidden.delete(cb.dataset.k) : hidden.add(cb.dataset.k); restyle(); });
+    d.querySelectorAll('a').forEach(a => a.onclick = () => {
+      cats.forEach(k => a.dataset.a === 'on' ? hidden.delete(k) : hidden.add(k));
+      d.querySelectorAll('input').forEach(cb => cb.checked = a.dataset.a === 'on'); restyle();
+    });
+    return d;
+  };
+  legendCtl.addTo(map);
+}
+
+function select(id, zoom) {
+  const prev = selected; selected = id;
+  if (prev && byId[prev]) byId[prev].setStyle(styleOf(prev));
+  const layer = byId[id];
+  const panel = document.getElementById('panel');
+  if (!layer) { panel.innerHTML = `<p>fid ${esc(id)} は見つかりません。</p>`; return; }
+  layer.setStyle(styleOf(id)); layer.bringToFront();
+  if (zoom) map.fitBounds(layer.getBounds(), { maxZoom: 19 });
+
+  const p = layer.feature.properties, hist = history[id] || [], r = hist[0];
+  const chip = st => `<span class="chip" style="background:${colorOf(st) || '#fff'};color:${['耕作放棄','水稲','果樹','そば'].includes(st) ? '#fff' : '#222'}">${esc(st)}</span>`;
+  panel.innerHTML = `
+    <h2>fid ${esc(id)} <span class="muted" style="font-weight:400">(${esc(p['地目'] || '地目不明')})</span></h2>
+    ${r ? `<table>
+      <tr><th>作付状況</th><td>${chip(r[CONFIG.statusField])}</td></tr>
+      <tr><th>作目</th><td>${esc(r['作目'])}</td></tr>
+      <tr><th>調査日</th><td>${esc(r['調査日'])}</td></tr>
+      <tr><th>調査者</th><td>${esc(r['調査者'])}</td></tr>
+      <tr><th>備考</th><td>${esc(r['備考'])}</td></tr></table>`
+      : '<p class="muted">この筆はまだ調査されていません。</p>'}
+    ${hist.length > 1 ? `<h2>調査履歴(${hist.length}件)</h2>` + hist.map(h => `
+      <div class="card"><div class="d">${esc(h['調査日'])} ・ 調査者 ${esc(h['調査者'])}</div>
+      ${chip(h[CONFIG.statusField])}${esc(h['作目'])}
+      ${h['備考'] ? `<div style="white-space:pre-wrap;margin-top:3px">${esc(h['備考'])}</div>` : ''}</div>`).join('') : ''}`;
+}
+
+function updateLabels() {
+  const on = map.getZoom() >= CONFIG.showLabels;
+  if (on && !map.hasLayer(labelLayer)) labelLayer.addTo(map);
+  if (!on && map.hasLayer(labelLayer)) map.removeLayer(labelLayer);
+}
+map.on('zoomend', updateLabels);
+
+// 操作
+const go = () => { const v = document.getElementById('q').value.trim(); if (v) select(String(parseInt(v, 10)), true); };
+document.getElementById('go').onclick = go;
+document.getElementById('q').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+document.getElementById('kw').addEventListener('input', e => {
+  keyword = e.target.value.trim(); restyle();
+  if (keyword) {
+    const hit = Object.keys(byId).filter(visible);
+    setStatus(`「${keyword}」該当 ${hit.length} 筆`);
+    if (hit.length) map.fitBounds(L.featureGroup(hit.map(i => byId[i])).getBounds(), { maxZoom: 18, padding: [30, 30] });
+  } else setStatus(`調査済 ${Object.keys(history).length} / ${Object.keys(byId).length} 筆`);
+});
+document.getElementById('reload').onclick = () => loadAll().catch(showErr);
+let here = null;
+document.getElementById('locate').onclick = () => map.locate({ setView: true, maxZoom: 18 });
+map.on('locationfound', e => { if (here) here.remove(); here = L.circleMarker(e.latlng, { radius: 8, color: '#fff', weight: 2, fillColor: '#1e88e5', fillOpacity: 1 }).addTo(map); });
+map.on('locationerror', () => alert('現在地を取得できませんでした(位置情報の許可を確認してください)'));
+
+const showErr = e => { setStatus(''); document.getElementById('panel').innerHTML =
+  `<p style="color:#c00">データを読み込めませんでした:${esc(e.message)}</p>
+   <p class="muted">index.html をダブルクリックで開いた場合は表示されません。GitHub Pages上、またはローカルサーバー経由で開いてください(README参照)。</p>`; };
+loadAll().catch(showErr);
+</script>
+</body>
+</html>
